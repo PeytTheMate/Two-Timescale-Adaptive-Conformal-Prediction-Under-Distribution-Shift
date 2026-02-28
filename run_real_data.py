@@ -1,0 +1,725 @@
+"""
+Real-Data Validation for Adaptive Conformal Prediction (v4)
+============================================================
+Validates TTS conformal prediction on real datasets with:
+  - Temporal block bootstrap (replaces pseudo-seed noise perturbation)
+  - GradientBoosting + feature engineering (replaces Ridge on raw features)
+  - Model comparison (Ridge vs GBR) for honest framing
+  - Multiple datasets (Beijing PM2.5 + Jena Climate)
+
+Usage:
+    python run_real_data.py
+
+Requires: data/beijing_features.csv + data/beijing_targets.csv.
+          Jena Climate auto-downloads to data/ on first run.
+
+Produces (in figures/real_data/):
+    - exp_d_real_*_ridge.png / exp_d_real_*_gbr.png: Per-model figures
+    - exp_d_real_*_comparison.png: Ridge vs GBR comparison
+    - Console: Tables, verification checks, statistical tests
+"""
+
+import numpy as np
+import pandas as pd
+import warnings
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import GradientBoostingRegressor
+from scipy import stats as sp_stats
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import time
+import os
+import sys
+import urllib.request
+import zipfile
+import io
+
+warnings.filterwarnings('ignore')
+
+_PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+FIGURES_DIR = os.path.join(_PROJECT_ROOT, 'figures', 'real_data')
+DATA_DIR = os.path.join(_PROJECT_ROOT, 'data')
+os.makedirs(FIGURES_DIR, exist_ok=True)
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# ============================================================================
+# IMPORT CORE METHODS FROM V3
+# ============================================================================
+
+try:
+    import conformal_experiments_v3 as v3_module
+    from conformal_experiments_v3 import (
+        run_static_cp, run_aci, run_dtaci, run_refit_only,
+        compute_coverage_debt, compute_recovery_time, rolling_mean,
+        compute_abs_residuals, paired_wilcoxon_test, holm_bonferroni,
+        CONFIG, COLORS
+    )
+    V3_IMPORTED = True
+    print("[OK] Imported methods from conformal_experiments_v3.py")
+except ImportError:
+    V3_IMPORTED = False
+    print("[WARN] conformal_experiments_v3.py not found, using built-in methods")
+
+    CONFIG = {'n_seeds': 10, 'target_alpha': 0.1, 'target_coverage': 0.9,
+              'aci_gamma': 0.005, 'dtaci_gammas': [0.001, 0.002, 0.005, 0.01, 0.02],
+              'tts_K': 50, 'tts_train_window': 200, 'tts_cal_size': 50}
+    COLORS = {'Static CP': '#95a5a6', 'ACI-Only': '#e67e22',
+              'DtACI': '#9b59b6', 'TTS (Ours)': '#27ae60'}
+
+    def rolling_mean(arr, window=100):
+        n = len(arr); out = np.full(n, np.nan)
+        cs = np.cumsum(np.insert(arr, 0, 0))
+        for i in range(n):
+            s = max(0, i - window + 1)
+            out[i] = (cs[i+1] - cs[s]) / (i - s + 1)
+        return out
+    def _fit_model_default(X, Y, ridge_alpha=0.01):
+        m = Ridge(alpha=ridge_alpha); m.fit(X, Y); return m
+    _current_fit_model = _fit_model_default
+    def fit_model(X, Y, ridge_alpha=0.01):
+        return _current_fit_model(X, Y, ridge_alpha)
+    def compute_abs_residuals(model, X, Y):
+        return np.abs(Y - model.predict(X))
+    def compute_recovery_time(cov, shift_at, threshold=0.85, window=100, max_steps=500):
+        for t in range(shift_at+30, min(shift_at+max_steps, len(cov))):
+            if np.mean(cov[max(shift_at,t-window+1):t+1]) >= threshold: return t - shift_at
+        return max_steps
+    def compute_coverage_debt(cov, shift_at, target=0.9, post_window=200, window=100):
+        debt = 0.0
+        for t in range(shift_at, min(shift_at+post_window, len(cov))):
+            debt += max(0, target - np.mean(cov[max(shift_at,t-window+1):t+1]))
+        return debt
+    def paired_wilcoxon_test(x, y):
+        diff = np.array(x) - np.array(y)
+        if np.all(diff == 0): return 0, 1.0
+        try: return sp_stats.wilcoxon(diff, alternative='two-sided')
+        except: return 0, 1.0
+    def holm_bonferroni(pvals):
+        m = len(pvals); order = np.argsort(pvals); adj = np.zeros(m)
+        for r, i in enumerate(order): adj[i] = min(1.0, pvals[i] * (m - r))
+        for r in range(1, m): adj[order[r]] = max(adj[order[r]], adj[order[r-1]])
+        return adj
+    def run_static_cp(X, Y, start_t, alpha=0.1, cal_window=200):
+        n = len(Y); model = fit_model(X[:start_t], Y[:start_t])
+        cov, intv = np.zeros(n), np.zeros(n)
+        buf = list(compute_abs_residuals(model, X[max(0,start_t-cal_window):start_t], Y[max(0,start_t-cal_window):start_t]))
+        for t in range(start_t, n):
+            pred = model.predict(X[t:t+1])[0]; q = np.quantile(buf[-cal_window:], 1-alpha)
+            lo, hi = pred-q, pred+q; cov[t] = float(lo <= Y[t] <= hi); intv[t] = hi - lo
+            buf.append(abs(Y[t] - pred))
+        return cov, intv
+    def run_aci(X, Y, start_t, alpha=0.1, gamma=None, cal_window=200, refit=False, K=None, train_win=200):
+        if gamma is None: gamma = CONFIG['aci_gamma']
+        if K is None: K = CONFIG['tts_K']
+        n = len(Y); model = fit_model(X[:start_t], Y[:start_t])
+        cov, intv = np.zeros(n), np.zeros(n); alpha_t = alpha
+        buf = list(compute_abs_residuals(model, X[max(0,start_t-50):start_t], Y[max(0,start_t-50):start_t]))
+        for t in range(start_t, n):
+            if refit and (t-start_t) % K == 0 and t > start_t:
+                model = fit_model(X[max(0,t-train_win):t], Y[max(0,t-train_win):t])
+                buf = list(compute_abs_residuals(model, X[max(0,t-50):t], Y[max(0,t-50):t]))
+            pred = model.predict(X[t:t+1])[0]
+            q = np.quantile(buf[-cal_window:], 1 - np.clip(alpha_t, 0.01, 0.99)) if buf else 1.0
+            lo, hi = pred-q, pred+q; covered = float(lo <= Y[t] <= hi)
+            cov[t] = covered; intv[t] = hi - lo
+            alpha_t = np.clip(alpha_t + gamma*(alpha - (1.0-covered)), 0.0, 1.0)
+            buf.append(abs(Y[t] - pred))
+        return cov, intv
+    def run_dtaci(X, Y, start_t, alpha=0.1, cal_window=200, refit=False, K=50, train_win=200):
+        n = len(Y); model = fit_model(X[:start_t], Y[:start_t])
+        gammas = CONFIG['dtaci_gammas']; ne = len(gammas)
+        alphas = np.full(ne, alpha); ew = np.ones(ne)/ne; eta = 0.1
+        cov, intv = np.zeros(n), np.zeros(n)
+        buf = list(compute_abs_residuals(model, X[max(0,start_t-50):start_t], Y[max(0,start_t-50):start_t]))
+        for t in range(start_t, n):
+            if refit and (t-start_t) % K == 0 and t > start_t:
+                model = fit_model(X[max(0,t-train_win):t], Y[max(0,t-train_win):t])
+                buf = list(compute_abs_residuals(model, X[max(0,t-50):t], Y[max(0,t-50):t]))
+            pred = model.predict(X[t:t+1])[0]
+            agg = np.clip(np.dot(ew, alphas), 0.01, 0.99)
+            q = np.quantile(buf[-cal_window:], 1-agg) if buf else 1.0
+            lo, hi = pred-q, pred+q; covered = float(lo <= Y[t] <= hi)
+            cov[t] = covered; intv[t] = hi - lo
+            err = 1.0 - covered; losses = np.zeros(ne)
+            for j in range(ne):
+                alphas[j] = np.clip(alphas[j]+gammas[j]*(alpha-err), 0, 1)
+                losses[j] = max(alpha*(1-covered), (1-alpha)*covered)
+            ew *= np.exp(-eta*losses); ew /= ew.sum()
+            buf.append(abs(Y[t]-pred))
+        return cov, intv
+
+
+# ============================================================================
+# MODEL BACKEND SWITCHING
+# ============================================================================
+
+def fit_model_gbr(X, Y, ridge_alpha=0.01):
+    """GradientBoosting model for non-linear real data."""
+    m = GradientBoostingRegressor(
+        n_estimators=30, max_depth=3, subsample=0.8,
+        learning_rate=0.15, min_samples_leaf=15, random_state=42
+    )
+    m.fit(X, Y)
+    return m
+
+def fit_model_ridge(X, Y, ridge_alpha=0.01):
+    """Original Ridge model (linear baseline)."""
+    m = Ridge(alpha=ridge_alpha)
+    m.fit(X, Y)
+    return m
+
+def set_model_backend(model_type='gbr'):
+    """Swap the model used by all conformal methods."""
+    fn = fit_model_gbr if model_type == 'gbr' else fit_model_ridge
+    if V3_IMPORTED:
+        v3_module.fit_model = fn
+    else:
+        global _current_fit_model
+        _current_fit_model = fn
+
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+
+def detect_shifts(Y, min_start=300, min_end_buffer=150, min_gap=200):
+    """Detect distribution shifts via rolling mean changepoints."""
+    if len(Y) < 500:
+        return []
+    window = min(200, len(Y) // 10)
+    rm = np.convolve(Y, np.ones(window)/window, mode='same')
+    diff = np.abs(np.diff(rm))
+    threshold = np.percentile(diff, 97)
+    shift_candidates = np.where(diff > threshold)[0]
+    shifts = []
+    for s in shift_candidates:
+        if not shifts or s - shifts[-1] > min_gap:
+            shifts.append(int(s))
+    shifts = [s for s in shifts if min_start < s < len(Y) - min_end_buffer]
+    return shifts
+
+
+def compute_rolling_stats(arr, window=24):
+    """Compute rolling mean and std for a 1D array."""
+    n = len(arr)
+    means = np.full(n, arr[0], dtype=float)
+    stds = np.full(n, 0.0, dtype=float)
+    for i in range(1, n):
+        s = max(0, i - window)
+        means[i] = np.mean(arr[s:i])
+        stds[i] = np.std(arr[s:i]) if i - s > 1 else 0.0
+    return means, stds
+
+
+# ============================================================================
+# REAL DATA LOADERS
+# ============================================================================
+
+def load_beijing_pm25(features_path=None,
+                      targets_path=None,
+                      n=3000, window_idx=0):
+    """
+    Load Beijing PM2.5 with engineered temporal features.
+
+    window_idx selects a non-overlapping temporal block from the full dataset
+    for temporal block bootstrap. With ~41k valid rows and n=3000, there are
+    13 non-overlapping windows available, each covering a distinct ~4-month
+    period with different seasonal/pollution characteristics.
+    """
+    if features_path is None:
+        features_path = os.path.join(DATA_DIR, 'beijing_features.csv')
+    if targets_path is None:
+        targets_path = os.path.join(DATA_DIR, 'beijing_targets.csv')
+    X_df = pd.read_csv(features_path)
+    Y_df = pd.read_csv(targets_path)
+
+    # Find target column
+    y_col = None
+    for c in Y_df.columns:
+        if 'pm2' in c.lower() or 'pm_2' in c.lower():
+            y_col = c; break
+    if y_col is None:
+        y_col = Y_df.columns[0]
+
+    # Combine all columns, drop NaN rows
+    combined = pd.concat([X_df, Y_df[[y_col]]], axis=1).dropna()
+    total_valid = len(combined)
+
+    # Extract temporal block with stride for overlapping bootstrap
+    # Stride of 2000 gives ~20 available blocks with decent diversity
+    stride = max(n // 2, 1500)
+    start = window_idx * stride
+    if start + n > total_valid:
+        start = (window_idx * 731) % max(1, total_valid - n)
+    block = combined.iloc[start:start + n].copy().reset_index(drop=True)
+
+    if len(block) < n:
+        raise ValueError(f"Block {window_idx} only has {len(block)} rows (need {n})")
+
+    # --- Target ---
+    Y = block[y_col].values.astype(float)
+
+    # --- Raw weather features ---
+    weather_cols = [c for c in ['DEWP', 'TEMP', 'PRES', 'Iws', 'Is', 'Ir']
+                    if c in block.columns]
+    weather = block[weather_cols].values.astype(float)
+
+    # --- Cyclical temporal encoding ---
+    hour = block['hour'].values.astype(float) if 'hour' in block.columns else np.zeros(n)
+    month = block['month'].values.astype(float) if 'month' in block.columns else np.ones(n)
+    hour_sin = np.sin(2 * np.pi * hour / 24)
+    hour_cos = np.cos(2 * np.pi * hour / 24)
+    month_sin = np.sin(2 * np.pi * month / 12)
+    month_cos = np.cos(2 * np.pi * month / 12)
+
+    # --- Wind direction one-hot ---
+    if 'cbwd' in block.columns:
+        cbwd_dummies = pd.get_dummies(block['cbwd'], prefix='wind').values.astype(float)
+    else:
+        cbwd_dummies = np.zeros((n, 1))
+
+    # --- Lagged PM2.5 (autoregressive features) ---
+    lag_1 = np.roll(Y, 1); lag_1[0] = Y[0]
+    lag_3 = np.roll(Y, 3); lag_3[:3] = Y[0]
+    lag_6 = np.roll(Y, 6); lag_6[:6] = Y[0]
+    lag_24 = np.roll(Y, 24); lag_24[:24] = Y[0]
+
+    # --- Rolling statistics (24h window) ---
+    roll_mean, roll_std = compute_rolling_stats(Y, window=24)
+
+    # --- Time trend ---
+    t_norm = np.arange(n, dtype=float) / n
+
+    X = np.column_stack([
+        weather, hour_sin, hour_cos, month_sin, month_cos,
+        cbwd_dummies, lag_1, lag_3, lag_6, lag_24,
+        roll_mean, roll_std, t_norm
+    ])
+
+    shifts = detect_shifts(Y)
+
+    if window_idx == 0:
+        print(f"    Total valid rows: {total_valid}, block size: {n}")
+        print(f"    Features: {X.shape[1]} ({len(weather_cols)} weather + "
+              f"4 cyclical + {cbwd_dummies.shape[1]} wind + 4 lags + 2 rolling + 1 trend)")
+        print(f"    Y stats: mean={Y.mean():.1f}, std={Y.std():.1f}")
+
+    return X, Y, shifts
+
+
+def load_jena_climate(csv_path=None, n=3000, window_idx=0):
+    """
+    Load Jena Climate dataset (temperature prediction).
+    Auto-downloads from Google Storage on first run.
+
+    Has strong diurnal + seasonal cycles = natural distribution shifts.
+    ~70k hourly rows after downsampling from 10-minute intervals.
+    """
+    if csv_path is None:
+        csv_path = os.path.join(DATA_DIR, 'jena_climate.csv')
+    if not os.path.exists(csv_path):
+        print(f"    Downloading Jena Climate dataset...")
+        url = ('https://storage.googleapis.com/tensorflow/'
+               'tf-keras-datasets/jena_climate_2009_2016.csv.zip')
+        try:
+            response = urllib.request.urlopen(url, timeout=30)
+            with zipfile.ZipFile(io.BytesIO(response.read())) as z:
+                csv_name = z.namelist()[0]
+                with z.open(csv_name) as f_in:
+                    data = f_in.read()
+                with open(csv_path, 'wb') as f_out:
+                    f_out.write(data)
+            print(f"    Saved to {csv_path}")
+        except Exception as e:
+            print(f"    Download failed: {e}")
+            print(f"    Skipping Jena Climate dataset.")
+            return None, None, None
+
+    df = pd.read_csv(csv_path)
+
+    # Downsample from 10-minute to hourly
+    df = df.iloc[::6].reset_index(drop=True)
+    total_rows = len(df)
+
+    # Extract temporal block with stride for overlapping bootstrap
+    stride = max(n // 2, 1500)
+    start = window_idx * stride
+    if start + n > total_rows:
+        start = (window_idx * 731) % max(1, total_rows - n)
+    block = df.iloc[start:start + n].copy().reset_index(drop=True)
+
+    if len(block) < n:
+        raise ValueError(f"Jena block {window_idx} only has {len(block)} rows")
+
+    # Parse datetime
+    dt = pd.to_datetime(block['Date Time'], format='%d.%m.%Y %H:%M:%S')
+    hour = dt.dt.hour.values.astype(float)
+    month = dt.dt.month.values.astype(float)
+
+    # Target: temperature
+    target_col = 'T (degC)'
+    Y = block[target_col].values.astype(float)
+
+    # Features: all numeric columns except target
+    numeric_cols = block.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = [c for c in numeric_cols if c != target_col]
+    weather = block[numeric_cols].values.astype(float)
+
+    # Cyclical encoding
+    hour_sin = np.sin(2 * np.pi * hour / 24)
+    hour_cos = np.cos(2 * np.pi * hour / 24)
+    month_sin = np.sin(2 * np.pi * month / 12)
+    month_cos = np.cos(2 * np.pi * month / 12)
+
+    # Lagged target
+    lag_1 = np.roll(Y, 1); lag_1[0] = Y[0]
+    lag_6 = np.roll(Y, 6); lag_6[:6] = Y[0]
+    lag_24 = np.roll(Y, 24); lag_24[:24] = Y[0]
+
+    # Rolling stats
+    roll_mean, roll_std = compute_rolling_stats(Y, window=24)
+
+    t_norm = np.arange(n, dtype=float) / n
+
+    X = np.column_stack([
+        weather, hour_sin, hour_cos, month_sin, month_cos,
+        lag_1, lag_6, lag_24, roll_mean, roll_std, t_norm
+    ])
+
+    shifts = detect_shifts(Y)
+
+    if window_idx == 0:
+        print(f"    Total hourly rows: {total_rows}, block size: {n}")
+        print(f"    Features: {X.shape[1]} ({len(numeric_cols)} weather + "
+              f"4 cyclical + 3 lags + 2 rolling + 1 trend)")
+        print(f"    Y stats: mean={Y.mean():.1f}, std={Y.std():.1f}")
+
+    return X, Y, shifts
+
+
+# ============================================================================
+# MAIN VALIDATION
+# ============================================================================
+
+def run_real_validation(dataset_name, loader_fn, loader_kwargs,
+                        n_blocks=10, start_t=300, model_types=('ridge', 'gbr')):
+    """
+    Run all methods on real data using temporal block bootstrap.
+
+    Instead of pseudo-seeds (noise perturbation on fixed data), each block
+    is a genuinely different temporal window from the full dataset. This gives
+    the Wilcoxon test real power from true cross-block variance.
+
+    Runs both Ridge and GBR to show that TTS advantage scales with model
+    expressiveness — the honest, nuanced finding.
+    """
+    print(f"\n{'='*70}")
+    print(f"  REAL DATA VALIDATION: {dataset_name}")
+    print(f"{'='*70}")
+
+    # Test-load block 0 to print dataset info
+    X0, Y0, _ = loader_fn(window_idx=0, **loader_kwargs)
+    if X0 is None:
+        return None
+
+    methods = ['Static CP', 'ACI-Only', 'DtACI', 'TTS (Ours)']
+    pc = {'Static CP': '#95a5a6', 'ACI-Only': '#e67e22',
+          'DtACI': '#9b59b6', 'TTS (Ours)': '#27ae60'}
+
+    all_model_results = {}
+
+    for model_type in model_types:
+        set_model_backend(model_type)
+        print(f"\n  --- Model: {model_type.upper()} ---")
+
+        agg = {m: {'cov': [], 'intv': [], 'debt_sum': [], 'efficiency': []}
+               for m in methods}
+
+        for block_idx in range(n_blocks):
+            np.random.seed(block_idx)
+            X, Y, shifts = loader_fn(window_idx=block_idx, **loader_kwargs)
+
+            R = {}
+            R['Static CP'] = run_static_cp(X, Y, start_t)
+            R['ACI-Only'] = run_aci(X, Y, start_t, refit=False)
+            R['DtACI'] = run_dtaci(X, Y, start_t, refit=False)
+            R['TTS (Ours)'] = run_aci(X, Y, start_t, refit=True)
+
+            for m in methods:
+                c, iv = R[m]
+                cov_mean = np.mean(c[start_t:])
+                intv_mean = np.mean(iv[start_t:])
+                total_debt = sum(compute_coverage_debt(c, s, post_window=150)
+                                 for s in shifts if start_t < s < len(c) - 150)
+                agg[m]['cov'].append(cov_mean)
+                agg[m]['intv'].append(intv_mean)
+                agg[m]['debt_sum'].append(total_debt)
+                agg[m]['efficiency'].append(total_debt / max(intv_mean, 0.01))
+
+        # === RESULTS TABLE ===
+        print(f"\n  {'Method':<15} {'Coverage':>12} {'Interval':>12} "
+              f"{'Total Debt':>12} {'Debt/Intv':>12}")
+        print(f"  {'-'*60}")
+        for m in methods:
+            a = agg[m]
+            print(f"  {m:<15} "
+                  f"{np.mean(a['cov']):>6.3f}+/-{np.std(a['cov']):>5.3f} "
+                  f"{np.mean(a['intv']):>6.1f}+/-{np.std(a['intv']):>5.1f} "
+                  f"{np.mean(a['debt_sum']):>6.1f}+/-{np.std(a['debt_sum']):>5.1f} "
+                  f"{np.mean(a['efficiency']):>6.2f}+/-{np.std(a['efficiency']):>5.2f}")
+
+        # === VERIFICATION CHECKS ===
+        print(f"\n  === VERIFICATION CHECKS ({model_type.upper()}) ===")
+
+        tts_intv = np.mean(agg['TTS (Ours)']['intv'])
+        aci_intv = np.mean(agg['ACI-Only']['intv'])
+        intv_ratio = tts_intv / max(aci_intv, 0.01)
+
+        tts_debt = np.mean(agg['TTS (Ours)']['debt_sum'])
+        aci_debt = np.mean(agg['ACI-Only']['debt_sum'])
+
+        tts_cov = np.mean(agg['TTS (Ours)']['cov'])
+
+        passes = 0
+
+        print(f"  1. Interval ratio (TTS/ACI): {intv_ratio:.3f}x")
+        if intv_ratio < 0.85:
+            passes += 1
+            print(f"     PASS: TTS intervals are {(1-intv_ratio)*100:.0f}% shorter than ACI")
+        elif intv_ratio < 1.0:
+            print(f"     MARGINAL: TTS intervals are {(1-intv_ratio)*100:.0f}% shorter")
+        else:
+            print(f"     FAIL: TTS intervals are NOT shorter than ACI")
+
+        print(f"  2. Coverage: TTS={tts_cov:.3f}")
+        if tts_cov >= 0.85:
+            passes += 1
+            print(f"     PASS: TTS maintains >=85% coverage")
+        else:
+            print(f"     FAIL: TTS coverage below 85%")
+
+        print(f"  3. Debt: TTS={tts_debt:.1f} vs ACI={aci_debt:.1f}")
+        if tts_debt <= aci_debt * 1.5:
+            passes += 1
+            print(f"     PASS: TTS debt within 1.5x of ACI")
+        else:
+            print(f"     WARN: TTS debt notably higher")
+
+        _, p_intv = paired_wilcoxon_test(agg['TTS (Ours)']['intv'],
+                                         agg['ACI-Only']['intv'])
+        _, p_debt = paired_wilcoxon_test(agg['TTS (Ours)']['debt_sum'],
+                                         agg['ACI-Only']['debt_sum'])
+        sig_i = "***" if p_intv < 0.001 else "**" if p_intv < 0.01 else "*" if p_intv < 0.05 else "ns"
+        sig_d = "***" if p_debt < 0.001 else "**" if p_debt < 0.01 else "*" if p_debt < 0.05 else "ns"
+        print(f"\n  Paired Wilcoxon (temporal block bootstrap, n={n_blocks}):")
+        print(f"    TTS vs ACI on interval width: p={p_intv:.4f} {sig_i}")
+        print(f"    TTS vs ACI on coverage debt:  p={p_debt:.4f} {sig_d}")
+
+        if p_intv < 0.05:
+            passes += 1
+
+        print(f"\n  VERDICT ({model_type.upper()}): {passes}/4 checks passed.", end=" ")
+        if passes >= 3:
+            print("FINDINGS TRANSFER TO REAL DATA.")
+        elif passes >= 2:
+            print("PARTIAL SUPPORT.")
+        else:
+            print("FINDINGS DO NOT TRANSFER.")
+
+        all_model_results[model_type] = agg
+
+        # === PER-MODEL PLOT ===
+        # Use block 0 for visual inspection
+        set_model_backend(model_type)
+        np.random.seed(0)
+        X, Y, shifts = loader_fn(window_idx=0, **loader_kwargs)
+        R = {}
+        R['Static CP'] = run_static_cp(X, Y, start_t)
+        R['ACI-Only'] = run_aci(X, Y, start_t, refit=False)
+        R['DtACI'] = run_dtaci(X, Y, start_t, refit=False)
+        R['TTS (Ours)'] = run_aci(X, Y, start_t, refit=True)
+
+        fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+
+        ax = axes[0, 0]
+        for m in methods:
+            rc = rolling_mean(R[m][0][start_t:], window=150)
+            ax.plot(np.arange(start_t, start_t+len(rc)), rc,
+                    label=m, color=pc[m], lw=1.5)
+        ax.axhline(0.9, color='k', ls='--', alpha=0.5)
+        for s in shifts:
+            ax.axvline(s, color='red', ls=':', alpha=0.4)
+        ax.set_ylabel('Rolling Coverage'); ax.set_ylim(0.4, 1.05)
+        ax.set_title(f'{dataset_name} ({model_type.upper()}): Coverage', fontweight='bold')
+        ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
+
+        ax = axes[0, 1]
+        for m in methods:
+            ri = rolling_mean(R[m][1][start_t:], window=150)
+            ax.plot(np.arange(start_t, start_t+len(ri)), ri,
+                    label=m, color=pc[m], lw=1.5)
+        for s in shifts:
+            ax.axvline(s, color='red', ls=':', alpha=0.4)
+        ax.set_ylabel('Interval Length')
+        ax.set_title(f'{dataset_name} ({model_type.upper()}): Intervals', fontweight='bold')
+        ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
+
+        ax = axes[1, 0]
+        ax.plot(Y, color='black', lw=0.5, alpha=0.5)
+        rm_y = rolling_mean(Y, window=150)
+        ax.plot(rm_y, color='blue', lw=2, label='Rolling mean')
+        for i, s in enumerate(shifts):
+            ax.axvline(s, color='red', ls=':', alpha=0.6,
+                       label='Detected shift' if i == 0 else '')
+        ax.set_ylabel('Target Value')
+        ax.set_title(f'{dataset_name}: Raw Target + Shifts', fontweight='bold')
+        ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
+
+        ax = axes[1, 1]
+        x_pos = np.arange(len(methods))
+        intv_means = [np.mean(agg[m]['intv']) for m in methods]
+        intv_stds = [np.std(agg[m]['intv']) for m in methods]
+        ax.bar(x_pos, intv_means, yerr=intv_stds, capsize=5,
+               color=[pc[m] for m in methods], edgecolor='black')
+        ax.set_xticks(x_pos); ax.set_xticklabels(methods, fontsize=9)
+        ax.set_ylabel('Mean Interval Width')
+        ax.set_title(f'{dataset_name} ({model_type.upper()}): Interval Comparison',
+                      fontweight='bold')
+        ax.grid(True, alpha=0.3, axis='y')
+
+        plt.suptitle(f'Real Data Validation: {dataset_name} ({model_type.upper()})',
+                      fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        safe = dataset_name.replace(' ', '_').replace('(', '').replace(')', '').lower()
+        figpath = os.path.join(FIGURES_DIR, f'exp_d_real_{safe}_{model_type}.png')
+        plt.savefig(figpath, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  [Saved: {figpath}]")
+
+    # === MODEL COMPARISON FIGURE ===
+    if len(all_model_results) == 2 and all(v is not None for v in all_model_results.values()):
+        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+        for col, model_type in enumerate(model_types):
+            agg = all_model_results[model_type]
+
+            # Coverage-efficiency scatter
+            ax = axes[0, col]
+            for m in methods:
+                ax.errorbar(np.mean(agg[m]['intv']), np.mean(agg[m]['debt_sum']),
+                            xerr=np.std(agg[m]['intv']),
+                            yerr=np.std(agg[m]['debt_sum']),
+                            fmt='o', color=pc[m], markersize=10, capsize=5,
+                            label=m, markeredgecolor='black', markeredgewidth=0.5)
+            ax.set_xlabel('Mean Interval Width (lower = efficient)')
+            ax.set_ylabel('Coverage Debt (lower = better)')
+            ax.set_title(f'{model_type.upper()}: Coverage-Efficiency Tradeoff',
+                          fontweight='bold')
+            ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
+
+            # Interval bar chart
+            ax = axes[1, col]
+            x_pos = np.arange(len(methods))
+            intv_means = [np.mean(agg[m]['intv']) for m in methods]
+            intv_stds = [np.std(agg[m]['intv']) for m in methods]
+            ax.bar(x_pos, intv_means, yerr=intv_stds, capsize=5,
+                   color=[pc[m] for m in methods], edgecolor='black')
+            ax.set_xticks(x_pos); ax.set_xticklabels(methods, fontsize=9)
+            ax.set_ylabel('Mean Interval Width')
+            ax.set_title(f'{model_type.upper()}: Intervals', fontweight='bold')
+            ax.grid(True, alpha=0.3, axis='y')
+
+        plt.suptitle(f'{dataset_name}: Model Comparison (Ridge vs GBR)',
+                      fontsize=14, fontweight='bold')
+        plt.tight_layout()
+        safe = dataset_name.replace(' ', '_').replace('(', '').replace(')', '').lower()
+        figpath = os.path.join(FIGURES_DIR, f'exp_d_real_{safe}_comparison.png')
+        plt.savefig(figpath, dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  [Saved: {figpath}]")
+
+    return all_model_results
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+if __name__ == '__main__':
+    print("=" * 70)
+    print("  Real-Data Validation for Adaptive Conformal Prediction (v4)")
+    print("  Temporal Block Bootstrap + Model Comparison")
+    print("=" * 70)
+    t0 = time.time()
+
+    results = {}
+
+    # === Beijing PM2.5 ===
+    for feat_name, targ_name in [
+        ('beijing_features.csv', 'beijing_targets.csv'),
+        ('beijing_pm25_features.csv', 'beijing_pm25_targets.csv'),
+    ]:
+        feat_path = os.path.join(DATA_DIR, feat_name)
+        targ_path = os.path.join(DATA_DIR, targ_name)
+        if os.path.exists(feat_path) and os.path.exists(targ_path):
+            print(f"\n  Loading Beijing PM2.5 from {feat_path}...")
+            results['Beijing PM2.5'] = run_real_validation(
+                dataset_name='Beijing PM2.5',
+                loader_fn=load_beijing_pm25,
+                loader_kwargs={'features_path': feat_path,
+                               'targets_path': targ_path},
+                n_blocks=10,
+                model_types=('ridge', 'gbr')
+            )
+            break
+
+    # === Jena Climate ===
+    print(f"\n  Loading Jena Climate...")
+    try:
+        jena_result = run_real_validation(
+            dataset_name='Jena Climate',
+            loader_fn=load_jena_climate,
+            loader_kwargs={'csv_path': os.path.join(DATA_DIR, 'jena_climate.csv')},
+            n_blocks=10,
+            model_types=('ridge', 'gbr')
+        )
+        if jena_result is not None:
+            results['Jena Climate'] = jena_result
+    except Exception as e:
+        print(f"  Jena Climate failed: {e}")
+
+    # Restore original model backend
+    set_model_backend('ridge')
+
+    elapsed = time.time() - t0
+    print(f"\n{'='*70}")
+    print(f"  Total runtime: {elapsed:.1f}s")
+    print(f"{'='*70}")
+
+    print("""
+======================================================================
+  INTERPRETATION GUIDE
+======================================================================
+
+  This script runs BOTH Ridge (linear) and GBR (non-linear) models
+  on each dataset to tell the honest story:
+
+  IF GBR passes 3-4/4 checks but Ridge fails:
+    -> TTS advantage scales with model expressiveness.
+    -> Paper framing: "TTS is beneficial when model misspecification
+       is reducible via refitting."
+
+  IF both models pass:
+    -> TTS advantage is robust across model classes.
+    -> Strongest possible finding.
+
+  IF neither passes:
+    -> TTS does not help on this dataset's shift structure.
+    -> Paper should discuss when TTS helps vs. doesn't.
+
+  KEY CHANGE FROM v3: Temporal block bootstrap
+    - Each "seed" is now a genuinely different temporal window
+    - Wilcoxon test has real power from true cross-block variance
+    - Error bars reflect real uncertainty, not artificial noise
+======================================================================
+""")
