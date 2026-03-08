@@ -13,5 +13,8 @@ Thumbs.db
 .vscode/
 .idea/
 
-# Data
+# Data (large files downloaded at runtime)
 data/jena_climate.csv
+
+# Runtime artifacts
+enbpi_replication_results/_progress.log

@@ -1,0 +1,3 @@
+[submodule "EnbPI"]
+	path = EnbPI
+	url = https://github.com/hamrel-cxu/EnbPI.git
