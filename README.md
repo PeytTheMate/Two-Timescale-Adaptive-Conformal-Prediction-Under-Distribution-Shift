@@ -63,7 +63,7 @@ All pairwise comparisons use Wilcoxon signed-rank tests with Holm-Bonferroni cor
 
 ### When TTS Helps — and When It Doesn't
 
-TTS is beneficial when **model misspecification is reducible**: when refitting the base model on post-shift data actually improves predictions. When the model class cannot capture post-shift patterns, TTS degenerates gracefully to ACI — it does not make things worse.
+TTS is beneficial when model misspecification is reducible. In other words, when refitting the base model on post-shift data actually improves predictions. When the model class cannot capture post-shift patterns, TTS degenerates gracefully to ACI and it does not make things worse.
 
 ---
 

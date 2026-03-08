@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
-# .sh script developed by Anthropic's Claude AI
+# .sh script developed by Anthropic's Claude AI.
+#
 # Reproduce all experiments from:
 #   "Two-Timescale Conformal Prediction Under Distribution Shift"
 #

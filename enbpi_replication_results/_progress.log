@@ -1,0 +1,81 @@
+======================================================================
+Section 5.1 — Interval Validity (varying alpha)
+======================================================================
+Data: 8760 pts | Train: 1752 | Test: 7008
+
+  Feature type: Multivariate
+  Regressor: Ridge
+    alpha=0.05: Git=0.954 M-on=0.944 M-bat=0.801 (10s)
+    alpha=0.10: Git=0.904 M-on=0.890 M-bat=0.722 (9s)
+    alpha=0.15: Git=0.850 M-on=0.836 M-bat=0.640 (10s)
+    alpha=0.20: Git=0.794 M-on=0.778 M-bat=0.568 (10s)
+    alpha=0.25: Git=0.743 M-on=0.719 M-bat=0.523 (11s)
+  Regressor: RF
+    alpha=0.05: Git=0.954 M-on=0.951 M-bat=0.873 (54s)
+    alpha=0.10: Git=0.902 M-on=0.905 M-bat=0.580 (54s)
+    alpha=0.15: Git=0.854 M-on=0.868 M-bat=0.532 (53s)
+    alpha=0.20: Git=0.796 M-on=0.825 M-bat=0.465 (53s)
+    alpha=0.25: Git=0.752 M-on=0.788 M-bat=0.402 (52s)
+  Regressor: MLP
+    alpha=0.05: Git=0.954 M-on=0.939 M-bat=0.899 (41s)
+    alpha=0.10: Git=0.900 M-on=0.879 M-bat=0.855 (41s)
+    alpha=0.15: Git=0.853 M-on=0.828 M-bat=0.648 (41s)
+    alpha=0.20: Git=0.801 M-on=0.778 M-bat=0.591 (42s)
+    alpha=0.25: Git=0.753 M-on=0.731 M-bat=0.525 (44s)
+
+  Feature type: Univariate
+  Regressor: Ridge
+    alpha=0.05: Git=0.949 M-on=0.952 M-bat=0.877 (14s)
+    alpha=0.10: Git=0.899 M-on=0.898 M-bat=0.816 (13s)
+    alpha=0.15: Git=0.846 M-on=0.846 M-bat=0.692 (11s)
+    alpha=0.20: Git=0.797 M-on=0.793 M-bat=0.584 (11s)
+    alpha=0.25: Git=0.744 M-on=0.739 M-bat=0.518 (11s)
+  Regressor: RF
+    alpha=0.05: Git=0.951 M-on=0.947 M-bat=0.879 (61s)
+    alpha=0.10: Git=0.902 M-on=0.902 M-bat=0.795 (64s)
+    alpha=0.15: Git=0.852 M-on=0.853 M-bat=0.746 (58s)
+    alpha=0.20: Git=0.800 M-on=0.802 M-bat=0.702 (63s)
+    alpha=0.25: Git=0.751 M-on=0.756 M-bat=0.670 (66s)
+  Regressor: MLP
+    alpha=0.05: Git=0.952 M-on=0.952 M-bat=0.877 (49s)
+    alpha=0.10: Git=0.902 M-on=0.901 M-bat=0.772 (48s)
+    alpha=0.15: Git=0.849 M-on=0.848 M-bat=0.685 (44s)
+    alpha=0.20: Git=0.795 M-on=0.794 M-bat=0.602 (42s)
+    alpha=0.25: Git=0.748 M-on=0.746 M-bat=0.548 (42s)
+
+Saved section_5_1_results.csv (930 rows)
+
+======================================================================
+Section 5.2 — Effect of Training Size
+======================================================================
+Training sizes: [np.int64(876), np.int64(1654), np.int64(2433)] (of 8760 total)
+
+  Feature type: Multivariate
+  Regressor: Ridge
+    train_size=876: Git=0.895 M-on=0.890 M-bat=0.585 (7s)
+    train_size=1654: Git=0.904 M-on=0.893 M-bat=0.744 (9s)
+    train_size=2433: Git=0.909 M-on=0.883 M-bat=0.711 (14s)
+  Regressor: RF
+    train_size=876: Git=0.897 M-on=0.901 M-bat=0.584 (54s)
+    train_size=1654: Git=0.903 M-on=0.907 M-bat=0.585 (58s)
+    train_size=2433: Git=0.913 M-on=0.912 M-bat=0.603 (58s)
+  Regressor: MLP
+    train_size=876: Git=0.894 M-on=0.892 M-bat=0.855 (26s)
+    train_size=1654: Git=0.900 M-on=0.883 M-bat=0.859 (40s)
+    train_size=2433: Git=0.915 M-on=0.906 M-bat=0.854 (63s)
+
+  Feature type: Univariate
+  Regressor: Ridge
+    train_size=876: Git=0.895 M-on=0.896 M-bat=0.736 (8s)
+    train_size=1654: Git=0.900 M-on=0.900 M-bat=0.825 (10s)
+    train_size=2433: Git=0.906 M-on=0.906 M-bat=0.859 (14s)
+  Regressor: RF
+    train_size=876: Git=0.896 M-on=0.904 M-bat=0.772 (61s)
+    train_size=1654: Git=0.903 M-on=0.904 M-bat=0.824 (59s)
+    train_size=2433: Git=0.912 M-on=0.908 M-bat=0.853 (70s)
+  Regressor: MLP
+    train_size=876: Git=0.896 M-on=0.900 M-bat=0.727 (30s)
+    train_size=1654: Git=0.903 M-on=0.903 M-bat=0.778 (50s)
+    train_size=2433: Git=0.906 M-on=0.907 M-bat=0.842 (84s)
+
+Saved section_5_2_results.csv (558 rows)
